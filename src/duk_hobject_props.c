@@ -4387,47 +4387,69 @@ DUK_INTERNAL duk_ret_t duk_hobject_object_get_own_property_descriptor(duk_contex
 }
 
 /*
- *  NormalizePropertyDescriptor().
+ *  NormalizePropertyDescriptor() related helper.
  *
- *  Internal helper to convert an external property descriptor on stack top
- *  to a normalized form with plain, coerced values.  The original descriptor
- *  object is not altered.
+ *  Internal helper which validates and normalizes a property descriptor
+ *  represented as an Ecmascript object (e.g. argument to defineProperty()).
+ *  The output of this conversion is a set of defprop_flags and possibly
+ *  some values pushed on the value stack; some subset of: property value,
+ *  getter, setter.  Caller must manage stack top carefully because the
+ *  number of values pushed depends on the input property descriptor.
+ *
+ *  The original descriptor object must not be altered in the process.
  */
 
 /* XXX: very basic optimization -> duk_get_prop_stridx_top */
 
-DUK_LOCAL void duk__normalize_property_descriptor(duk_context *ctx) {
+DUK_INTERNAL
+void duk_hobject_prepare_property_descriptor(duk_context *ctx,
+                                             duk_idx_t idx_in,
+                                             duk_uint_t *out_defprop_flags,
+                                             duk_idx_t *out_idx_value,
+                                             duk_hobject **out_getter,
+                                             duk_hobject **out_setter) {
 	duk_hthread *thr = (duk_hthread *) ctx;
-	duk_idx_t idx_in;
-	duk_idx_t idx_out;
-	duk_idx_t target_top;
+	duk_idx_t idx_value = -1;
+	duk_hobject *getter = NULL;
+	duk_hobject *setter = NULL;
 	duk_bool_t is_data_desc = 0;
 	duk_bool_t is_acc_desc = 0;
+	duk_uint_t defprop_flags = 0;
 
 	DUK_ASSERT(ctx != NULL);
+	DUK_ASSERT(out_defprop_flags != NULL);
+	DUK_ASSERT(out_idx_value != NULL);
+	DUK_ASSERT(out_getter != NULL);
+	DUK_ASSERT(out_setter != NULL);
 
-	/* must be an object, otherwise TypeError (E5.1 Section 8.10.5, step 1) */
-	(void) duk_require_hobject(ctx, -1);
+	/* Must be an object, otherwise TypeError (E5.1 Section 8.10.5, step 1). */
+	idx_in = duk_require_normalize_index(ctx, idx_in);
+	(void) duk_require_hobject(ctx, idx_in);
 
-	idx_in = duk_require_normalize_index(ctx, -1);
-	duk_push_object(ctx);  /* [... desc_in desc_out] */
-	idx_out = idx_in + 1;
-
-	/* this approach allows us to be care-free with the "stack policy"
-	 * until the very end.
+	/* The coercion order must match the ToPropertyDescriptor() algorithm
+	 * so that side effects in coercion happen in the correct order.
+	 * (This order also happens to be compatible with duk_def_prop(),
+	 * although it doesn't matter in practice.)
 	 */
-	target_top = duk_get_top(ctx);
 
 	if (duk_get_prop_stridx(ctx, idx_in, DUK_STRIDX_VALUE)) {
 		is_data_desc = 1;
-		duk_put_prop_stridx(ctx, idx_out, DUK_STRIDX_VALUE);
+		defprop_flags |= DUK_DEFPROP_HAVE_VALUE;
+		idx_value = duk_get_top_index(ctx);
+		/* Leave 'value' on stack */
+	} else {
+		duk_pop(ctx);
 	}
 
 	if (duk_get_prop_stridx(ctx, idx_in, DUK_STRIDX_WRITABLE)) {
 		is_data_desc = 1;
-		duk_to_boolean(ctx, -1);
-		duk_put_prop_stridx(ctx, idx_out, DUK_STRIDX_WRITABLE);
+		if (duk_to_boolean(ctx, -1)) {
+			defprop_flags |= DUK_DEFPROP_HAVE_WRITABLE | DUK_DEFPROP_WRITABLE;
+		} else {
+			defprop_flags |= DUK_DEFPROP_HAVE_WRITABLE;
+		}
 	}
+	duk_pop(ctx);
 
 	if (duk_get_prop_stridx(ctx, idx_in, DUK_STRIDX_GET)) {
 		duk_tval *tv = duk_require_tval(ctx, -1);
@@ -4435,6 +4457,7 @@ DUK_LOCAL void duk__normalize_property_descriptor(duk_context *ctx) {
 
 		if (DUK_TVAL_IS_UNDEFINED(tv)) {
 			/* undefined is accepted */
+			DUK_ASSERT(getter == NULL);
 		} else {
 			/* NOTE: lightfuncs are coerced to full functions because
 			 * lightfuncs don't fit into a property value slot.  This
@@ -4444,9 +4467,13 @@ DUK_LOCAL void duk__normalize_property_descriptor(duk_context *ctx) {
 			if (h_get == NULL || !DUK_HOBJECT_IS_CALLABLE(h_get)) {
 				goto type_error;
 			}
+			getter = h_get;
 		}
-		duk_put_prop_stridx(ctx, idx_out, DUK_STRIDX_GET);
 		is_acc_desc = 1;
+		defprop_flags |= DUK_DEFPROP_HAVE_GETTER;
+		/* Leave 'getter' on stack */
+	} else {
+		duk_pop(ctx);
 	}
 
 	if (duk_get_prop_stridx(ctx, idx_in, DUK_STRIDX_SET)) {
@@ -4456,6 +4483,7 @@ DUK_LOCAL void duk__normalize_property_descriptor(duk_context *ctx) {
 		is_acc_desc = 1;
 		if (DUK_TVAL_IS_UNDEFINED(tv)) {
 			/* undefined is accepted */
+			DUK_ASSERT(setter == NULL);
 		}  else {
 			/* NOTE: lightfuncs are coerced to full functions because
 			 * lightfuncs don't fit into a property value slot.  This
@@ -4465,34 +4493,43 @@ DUK_LOCAL void duk__normalize_property_descriptor(duk_context *ctx) {
 			if (h_set == NULL || !DUK_HOBJECT_IS_CALLABLE(h_set)) {
 				goto type_error;
 			}
+			setter = h_set;
 		}
-		duk_put_prop_stridx(ctx, idx_out, DUK_STRIDX_SET);
 		is_acc_desc = 1;
+		defprop_flags |= DUK_DEFPROP_HAVE_SETTER;
+		/* Leave 'setter' on stack */
+	} else {
+		duk_pop(ctx);
 	}
 
 	if (duk_get_prop_stridx(ctx, idx_in, DUK_STRIDX_ENUMERABLE)) {
-		duk_to_boolean(ctx, -1);
-		duk_put_prop_stridx(ctx, idx_out, DUK_STRIDX_ENUMERABLE);
+		if (duk_to_boolean(ctx, -1)) {
+			defprop_flags |= DUK_DEFPROP_HAVE_ENUMERABLE | DUK_DEFPROP_ENUMERABLE;
+		} else {
+			defprop_flags |= DUK_DEFPROP_HAVE_ENUMERABLE;
+		}
 	}
+	duk_pop(ctx);
 
 	if (duk_get_prop_stridx(ctx, idx_in, DUK_STRIDX_CONFIGURABLE)) {
-		duk_to_boolean(ctx, -1);
-		duk_put_prop_stridx(ctx, idx_out, DUK_STRIDX_CONFIGURABLE);
+		if (duk_to_boolean(ctx, -1)) {
+			defprop_flags |= DUK_DEFPROP_HAVE_CONFIGURABLE | DUK_DEFPROP_CONFIGURABLE;
+		} else {
+			defprop_flags |= DUK_DEFPROP_HAVE_CONFIGURABLE;
+		}
 	}
+	duk_pop(ctx);
 
 	if (is_data_desc && is_acc_desc) {
 		goto type_error;
 	}
 
-	/* pop any crud */
-	duk_set_top(ctx, target_top);
+	*out_defprop_flags = defprop_flags;
+	*out_idx_value = idx_value;
+	*out_getter = getter;
+	*out_setter = setter;
 
-	/* [... desc_in desc_out] */
-
-	duk_remove(ctx, -2);
-
-	/* [... desc_out] */
-
+	/* [ ... value? getter? setter? ] */
 	return;
 
  type_error:
@@ -4500,10 +4537,9 @@ DUK_LOCAL void duk__normalize_property_descriptor(duk_context *ctx) {
 }
 
 /*
- *  Object.defineProperty()  (E5 Section 15.2.3.6)
+ *  Object.defineProperty() related helper  (E5 Section 15.2.3.6)
  *
- *  Inlines ToPropertyDescriptor() and all [[DefineOwnProperty]] exotic
- *  behaviors.
+ *  Inlines all [[DefineOwnProperty]] exotic behaviors.
  *
  *  Note: Ecmascript compliant [[DefineOwnProperty]](P, Desc, Throw) is not
  *  implemented directly, but Object.defineProperty() serves its purpose.
@@ -4516,18 +4552,19 @@ DUK_LOCAL void duk__normalize_property_descriptor(duk_context *ctx) {
  *  but not for plain values (e.g. strings).  Lightfuncs, even though
  *  primitive in a sense, are treated like objects and accepted as target
  *  values.
- *
- *  This is a Duktape/C function.
  */
 
 /* XXX: this is a major target for size optimization */
-DUK_INTERNAL duk_ret_t duk_hobject_object_define_property(duk_context *ctx) {
+DUK_INTERNAL
+duk_bool_t duk_hobject_define_property_helper(duk_context *ctx,
+                                              duk_uint_t defprop_flags,
+                                              duk_hobject *obj,
+                                              duk_hstring *key,
+                                              duk_idx_t idx_value,
+                                              duk_hobject *get,
+                                              duk_hobject *set) {
 	duk_hthread *thr = (duk_hthread *) ctx;
-	duk_hobject *obj;
-	duk_hstring *key;
-	duk_hobject *desc;
 	duk_uint32_t arr_idx;
-	duk_idx_t idx_desc;
 	duk_tval tv;
 	duk_bool_t has_enumerable;
 	duk_bool_t has_configurable;
@@ -4538,154 +4575,57 @@ DUK_INTERNAL duk_ret_t duk_hobject_object_define_property(duk_context *ctx) {
 	duk_bool_t is_enumerable;
 	duk_bool_t is_configurable;
 	duk_bool_t is_writable;
-	duk_idx_t idx_value;
-	duk_hobject *get;
-	duk_hobject *set;
+	duk_bool_t throw_flag;
 	duk_small_uint_t new_flags;
 	duk_propdesc curr;
 	duk_uint32_t arridx_new_array_length;  /* != 0 => post-update for array 'length' (used when key is an array index) */
 	duk_uint32_t arrlen_old_len;
 	duk_uint32_t arrlen_new_len;
 	duk_bool_t pending_write_protect;
-	duk_bool_t throw_flag = 1;   /* Object.defineProperty() calls [[DefineOwnProperty]] with Throw=true */
-
-	DUK_DDD(DUK_DDDPRINT("Object.defineProperty(): thr=%p obj=%!T key=%!T desc=%!T",
-	                     (void *) thr,
-	                     (duk_tval *) duk_get_tval(ctx, 0),
-	                     (duk_tval *) duk_get_tval(ctx, 1),
-	                     (duk_tval *) duk_get_tval(ctx, 2)));
 
 	DUK_ASSERT(thr != NULL);
 	DUK_ASSERT(thr->heap != NULL);
 	DUK_ASSERT(ctx != NULL);
+	DUK_ASSERT(obj != NULL);
+	DUK_ASSERT(key != NULL);
+	/* idx_value may be < 0 (no value), set and get may be NULL */
 
 	DUK_ASSERT_VALSTACK_SPACE(thr, DUK__VALSTACK_SPACE);
 
-	/* Lightfuncs are currently supported by coercing to a temporary
-	 * Function object; changes will be allowed (the coerced value is
-	 * extensible) but will be lost.
-	 */
-	obj = duk_require_hobject_or_lfunc_coerce(ctx, 0);
+	/* All the flags fit in 16 bits, so will fit into duk_bool_t. */
 
-	(void) duk_to_string(ctx, 1);
-	key = duk_require_hstring(ctx, 1);
-	desc = duk_require_hobject(ctx, 2);
-	DUK_UNREF(desc);
-	idx_desc = 2;
-
-	DUK_ASSERT(obj != NULL);
-	DUK_ASSERT(key != NULL);
-	DUK_ASSERT(desc != NULL);
+	has_writable = (defprop_flags & DUK_DEFPROP_HAVE_WRITABLE);
+	has_enumerable = (defprop_flags & DUK_DEFPROP_HAVE_ENUMERABLE);
+	has_configurable = (defprop_flags & DUK_DEFPROP_HAVE_CONFIGURABLE);
+	has_value = (defprop_flags & DUK_DEFPROP_HAVE_VALUE);
+	has_get = (defprop_flags & DUK_DEFPROP_HAVE_GETTER);
+	has_set = (defprop_flags & DUK_DEFPROP_HAVE_SETTER);
+	is_writable = (defprop_flags & DUK_DEFPROP_WRITABLE);
+	is_enumerable = (defprop_flags & DUK_DEFPROP_ENUMERABLE);
+	is_configurable = (defprop_flags & DUK_DEFPROP_CONFIGURABLE);
+	throw_flag = 1;   /* Object.defineProperty() calls [[DefineOwnProperty]] with Throw=true */
 
 	arr_idx = DUK_HSTRING_GET_ARRIDX_SLOW(key);
-
-	DUK_DDD(DUK_DDDPRINT("Object.defineProperty(): thr=%p obj=%!O key=%!O arr_idx=0x%08lx desc=%!O",
-	                     (void *) thr, (duk_heaphdr *) obj, (duk_heaphdr *) key,
-	                     (unsigned long) arr_idx, (duk_heaphdr *) desc));
-
-	/* Many of the above are just assigned over but are given base values to
-	 * avoid warnings with some compilers.  But because the values are unused,
-	 * scan-build will complain about them; silence with DUK_UNREF().
-	 */
-
-	has_enumerable = 0; DUK_UNREF(has_enumerable);
-	has_configurable = 0; DUK_UNREF(has_configurable);
-	has_value = 0; DUK_UNREF(has_value);
-	has_writable = 0; DUK_UNREF(has_writable);
-	has_get = 0; DUK_UNREF(has_get);
-	has_set = 0; DUK_UNREF(has_set);
-	is_enumerable = 0; DUK_UNREF(is_enumerable);
-	is_configurable = 0; DUK_UNREF(is_configurable);
-	is_writable = 0; DUK_UNREF(is_writable);
-	idx_value = -1; DUK_UNREF(idx_value);
-	get = NULL; DUK_UNREF(get);
-	set = NULL; DUK_UNREF(set);
 
 	arridx_new_array_length = 0;
 	pending_write_protect = 0;
 	arrlen_old_len = 0;
 	arrlen_new_len = 0;
 
-	/* XXX: just normalize the descriptor here too?  It would allow
-	 * lightfunc coercion to be limited to the normalization function.
-	 */
-
-	/*
-	 *  Extract property descriptor values as required in ToPropertyDescriptor().
-	 *  However, don't create an explicit property descriptor object: we don't
-	 *  want to create a new Ecmascript object, and the internal property descriptor
-	 *  does not support partial descriptors.
-	 *
-	 *  Note that ToPropertyDescriptor() does coercions with potential errors, so
-	 *  all coercions must be done first.  Boolean conversion of 'undefined' is false.
-	 */
-
-	is_enumerable = duk_get_prop_stridx_boolean(ctx, idx_desc, DUK_STRIDX_ENUMERABLE, &has_enumerable);
-	is_configurable = duk_get_prop_stridx_boolean(ctx, idx_desc, DUK_STRIDX_CONFIGURABLE, &has_configurable);
-
-	has_value = duk_get_prop_stridx(ctx, idx_desc, DUK_STRIDX_VALUE);
-	if (has_value) {
-		/* Note: we don't want to store a pointer to an duk_tval in the
-		 * valstack here, because a valstack resize (which may occur
-		 * on any gc) might invalidate it.
-		 */
-		idx_value = duk_require_top_index(ctx);
-	} else {
-		idx_value = -1;
-	}
-	/* leave value on stack intentionally to ensure we can refer to it later */
-
-	is_writable = duk_get_prop_stridx_boolean(ctx, idx_desc, DUK_STRIDX_WRITABLE, &has_writable);
-
-	has_get = duk_get_prop_stridx(ctx, idx_desc, DUK_STRIDX_GET);
-	get = NULL;
-	if (has_get && !duk_is_undefined(ctx, -1)) {
-		/* XXX: get = duk_require_callable_hobject(ctx, -1)? */
-		/* NOTE: lightfuncs are coerced to full functions because
-		 * lightfuncs don't fit into a property value slot.  This
-		 * has some side effects, see test-dev-lightfunc-accessor.js.
-		 */
-		get = duk_require_hobject_or_lfunc_coerce(ctx, -1);
-		DUK_ASSERT(get != NULL);
-		if (!DUK_HOBJECT_IS_CALLABLE(get)) {
-			goto fail_invalid_desc;
-		}
-	}
-	/* leave get on stack */
-
-	has_set = duk_get_prop_stridx(ctx, idx_desc, DUK_STRIDX_SET);
-	set = NULL;
-	if (has_set && !duk_is_undefined(ctx, -1)) {
-		/* NOTE: lightfuncs are coerced to full functions because
-		 * lightfuncs don't fit into a property value slot.  This
-		 * has some side effects, see test-dev-lightfunc-accessor.js.
-		 */
-		set = duk_require_hobject_or_lfunc_coerce(ctx, -1);
-		DUK_ASSERT(set != NULL);
-		if (!DUK_HOBJECT_IS_CALLABLE(set)) {
-			goto fail_invalid_desc;
-		}
-	}
-	/* leave set on stack */
-
-	if ((has_set || has_get) && (has_value || has_writable)) {
-		goto fail_invalid_desc;
-	}
-
-	/* [obj key desc value get set] */
-
 	DUK_DDD(DUK_DDDPRINT("has_enumerable=%ld is_enumerable=%ld "
 	                     "has_configurable=%ld is_configurable=%ld "
 	                     "has_writable=%ld is_writable=%ld "
 	                     "has_value=%ld value=%!T "
 	                     "has_get=%ld get=%p=%!O "
-	                     "has_set=%ld set=%p=%!O ",
+	                     "has_set=%ld set=%p=%!O "
+	                     "arr_idx=%ld",
 	                     (long) has_enumerable, (long) is_enumerable,
 	                     (long) has_configurable, (long) is_configurable,
 	                     (long) has_writable, (long) is_writable,
-	                     (long) has_value, (duk_tval *) duk_get_tval(ctx, idx_value),
+	                     (long) has_value, (duk_tval *) (idx_value >= 0 ? duk_get_tval(ctx, idx_value) : NULL),
 	                     (long) has_get, (void *) get, (duk_heaphdr *) get,
-	                     (long) has_set, (void *) set, (duk_heaphdr *) set));
+	                     (long) has_set, (void *) set, (duk_heaphdr *) set,
+	                     (long) arr_idx));
 
 	/*
 	 *  Array exotic behaviors can be implemented at this point.  The local variables
@@ -5403,16 +5343,10 @@ DUK_INTERNAL duk_ret_t duk_hobject_object_define_property(duk_context *ctx) {
 	}
 
  success_no_exotics:
-	/* no need to unwind stack (rewound automatically) */
-	duk_set_top(ctx, 1);  /* -> [ obj ] */
 	return 1;
 
  fail_virtual:
 	DUK_ERROR(thr, DUK_ERR_TYPE_ERROR, DUK_STR_PROPERTY_IS_VIRTUAL);
-	return 0;
-
- fail_invalid_desc:
-	DUK_ERROR(thr, DUK_ERR_TYPE_ERROR, DUK_STR_INVALID_DESCRIPTOR);
 	return 0;
 
  fail_not_writable_array_length:
@@ -5430,114 +5364,6 @@ DUK_INTERNAL duk_ret_t duk_hobject_object_define_property(duk_context *ctx) {
  fail_array_length_partial:
 	DUK_ERROR(thr, DUK_ERR_TYPE_ERROR, DUK_STR_ARRAY_LENGTH_WRITE_FAILED);
 	return 0;
-}
-
-/*
- *  Object.defineProperties()  (E5 Section 15.2.3.7)
- *
- *  This is an actual function call.
- */
-
-DUK_INTERNAL duk_ret_t duk_hobject_object_define_properties(duk_context *ctx) {
-	/* Lightfunc handling by ToObject() coercion. */
-	duk_require_hobject_or_lfunc_coerce(ctx, 0);  /* target */
-
-	duk_to_object(ctx, 1);        /* properties object */
-
-	DUK_DDD(DUK_DDDPRINT("target=%!iT, properties=%!iT",
-	                     (duk_tval *) duk_get_tval(ctx, 0),
-	                     (duk_tval *) duk_get_tval(ctx, 1)));
-
-	duk_push_object(ctx);
-	duk_enum(ctx, 1, DUK_ENUM_OWN_PROPERTIES_ONLY /*enum_flags*/);
-
-	/* [hobject props descriptors enum(props)] */
-
-	DUK_DDD(DUK_DDDPRINT("enum(properties)=%!iT",
-	                     (duk_tval *) duk_get_tval(ctx, 3)));
-
-	for (;;) {
-		if (!duk_next(ctx, 3, 1 /*get_value*/)) {
-			break;
-		}
-
-		DUK_DDD(DUK_DDDPRINT("-> key=%!iT, desc=%!iT",
-		                     (duk_tval *) duk_get_tval(ctx, -2),
-		                     (duk_tval *) duk_get_tval(ctx, -1)));
-
-		/* [hobject props descriptors enum(props) key desc] */
-
-		duk__normalize_property_descriptor(ctx);
-
-		/* [hobject props descriptors enum(props) key desc_norm] */
-
-		duk_put_prop(ctx, 2);
-
-		/* [hobject props descriptors enum(props)] */
-	}
-
-	DUK_DDD(DUK_DDDPRINT("-> descriptors=%!iT",
-	                     (duk_tval *) duk_get_tval(ctx, 2)));
-
-	/* We rely on 'descriptors' having the same key order as 'props'
-	 * to match the array semantics of E5 Section 15.2.3.7.
-	 */
-
-	duk_pop(ctx);
-	duk_enum(ctx, 2, 0 /*enum_flags*/);
-
-	/* [hobject props descriptors enum(descriptors)] */
-
-	DUK_DDD(DUK_DDDPRINT("enum(descriptors)=%!iT",
-	                     (duk_tval *) duk_get_tval(ctx, 3)));
-
-	/* XXX: We need access to the -original- Object.defineProperty() here.
-	 * The property is configurable so the caller may have changed it.
-	 * This is not a good approach as a new Ecmascript function is created
-	 * for every defineProperties() call, but suffices for now.
-	 */
-
-	duk_push_c_function(ctx, duk_hobject_object_define_property, 3);
-
-	/* [hobject props descriptors enum(descriptors) defineProperty] */
-
-	for (;;) {
-		if (!duk_next(ctx, 3, 1 /*get_value*/)) {
-			break;
-		}
-
-		DUK_DDD(DUK_DDDPRINT("-> key=%!iT, desc=%!iT",
-		                     (duk_tval *) duk_get_tval(ctx, -2),
-		                     (duk_tval *) duk_get_tval(ctx, -1)));
-
-		/* [hobject props descriptors enum(descriptors) defineProperty key desc_norm] */
-
-		duk_dup(ctx, 0);
-		duk_insert(ctx, -3);
-
-		/* [hobject props descriptors enum(descriptors) defineProperty hobject key desc_norm] */
-
-		duk_dup(ctx, 4);
-		duk_insert(ctx, -4);
-
-		/* [hobject props descriptors enum(descriptors) defineProperty defineProperty hobject key desc_norm] */
-
-		duk_call(ctx, 3);
-
-		/* [hobject props descriptors enum(descriptors) definePropert defineProperty retval] */
-
-		/* XXX: call which ignores result would be nice */
-
-		duk_pop(ctx);
-	}
-
-	/* [hobject props descriptors enum(descriptors) defineProperty ] */
-
-	duk_dup(ctx, 0);
-
-	/* [hobject props descriptors enum(descriptors) defineProperty hobject] */
-
-	return 1;
 }
 
 /*
